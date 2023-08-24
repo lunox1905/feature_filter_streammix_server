@@ -21,6 +21,9 @@ const client = new MeiliSearch({
 })
 
 const socket = io("https://api-dev.streammix.co");
+const maxCommnetIndexHits = 1000000
+const maxReactionIndexHits = 100000
+const maxShareIndexHits = 50000
 const ISEMPTY = 'isEmpty'
 socket.on("connect", () => {
   })
@@ -36,14 +39,13 @@ function connectSocketStreammix (idChannel) {
         }
       });
       socket.on("comment", (cm) => {
-        handleCommentsData(cm, idChannel)
+        addCommentIndexes(cm, idChannel)
       });
       socket.on("share", (cm) => {
         addShareIndexes(cm, idChannel)
         
       });
       socket.on("reaction", (cm) => {
-        console.log(cm)
         addReactionIndexes(cm, idChannel)
       });
   } catch(e) {
@@ -52,7 +54,7 @@ function connectSocketStreammix (idChannel) {
 }
   
 
-const convertCommentToObj = (comment, isFirstComment) => {
+const convertCommentToObj = (comment) => {
   return {
     id: comment.id.replace("comment:", ""),
     text: comment.text.replace('"', ''),
@@ -66,50 +68,14 @@ const convertCommentToObj = (comment, isFirstComment) => {
     serverTime: comment.serverTime,
     workerId: comment.workerId,
     timestamp: comment.timestamp,
-    timeConvert: comment.timeConvert,
-    source: comment.source,
-    isFirstComment
   }
 }
-const handleCommentsData = async (comments, idChannel) => {
+const handleCommentsData = (comments) => {
   let commentsArrayFlat = []
-  let promises = []
   comments.forEach((comment) => {
-    const processCheckComment = client.index('comments_' + idChannel).getDocuments({
-      filter: `text = "${comment.text.replace('"', '')}" AND author_id = '${comment.author.id}'`,
-      fields: ['text'],
-      limit: 1
-    })
-    .then(commentExit => {
-      if (commentExit.results.length > 0) {
-        commentsArrayFlat.push(convertCommentToObj(comment, isFirstComment = false))
-      } else {
-        commentsArrayFlat.push(convertCommentToObj(comment, isFirstComment = true))
-      }
-    })
-    .catch(() => {
-      commentsArrayFlat.push(convertCommentToObj(comment, isFirstComment = true))
-    })
-    promises.push(processCheckComment);
+    commentsArrayFlat.push(convertCommentToObj(comment))
   });
-
-  Promise.all(promises)
-  .then(() => {
-    addCommentIndexes(commentsArrayFlat, idChannel)
-  })
-}
-
-const checkDuplicateCommentInMoment = (comments) => {
-  const newComment = []
-  comments.forEach((comment) => {
-    if(newComment.some(c => c.text == comment.text && c.author_id == comment.author_id)) {
-      comment.isFirstComment = false
-      newComment.push(comment)
-    } else {
-      newComment.push(comment)
-    }
-  })
-  return newComment
+  return commentsArrayFlat
 }
 
 const handleReactionsData = (reactions) => {
@@ -132,11 +98,10 @@ const handleShareData = (shares) => {
   return newShares
 }
 
-const addCommentIndexes = async (comments, idChannel) => {
-  if(comments?.length > 0) {
-    const commentsArrayFlat = checkDuplicateCommentInMoment(comments)
-    client.index('comments_' + idChannel).addDocuments(commentsArrayFlat,  { primaryKey: 'id' })
-  }
+const addCommentIndexes = (comments, idChannel) => {
+  const commentsArrayFlat = handleCommentsData(comments)
+  console.log(commentsArrayFlat)
+  client.index('comments_' + idChannel).addDocuments(commentsArrayFlat,  { primaryKey: 'id' })
 }
 
 const addReactionIndexes = (reaction, idChannel) => {
@@ -153,14 +118,14 @@ const getFilterString = async (filter, idChannel, searchQuery, valueFilter) => {
   switch(filter) {
     case 'reacted':
       try {
-        const reactions = await client.index('reactions_' + idChannel).getDocuments({limit: 50000})
+        const reactions = await client.index('reactions_' + idChannel).getDocuments({limit: maxReactionIndexHits})
         if(reactions) return `(author_id IN [${reactions.results.map(reaction => reaction.id)}])`
       } catch {
         return ISEMPTY
       }
     case 'shared':
       try {
-        const shares = await client.index('share_' + idChannel).getDocuments({limit: 1000})
+        const shares = await client.index('share_' + idChannel).getDocuments({limit: maxShareIndexHits})
         if(shares) return `(author_id IN [${shares.results.map(share => share.id)}])`
       } catch {
         return ISEMPTY
@@ -170,10 +135,8 @@ const getFilterString = async (filter, idChannel, searchQuery, valueFilter) => {
     case 'filterByTime':
       if(valueFilter[0] > 0 && valueFilter[1] > 0) return `(timestamp ${valueFilter[0]} TO ${valueFilter[1]})`
       else return ''
-    case 'removeDuplicateComment':
-      return `(isFirstComment = true)`
     case 'filterLatestComment':
-      if(valueFilter.length > 0) return `(isFirstComment = true) AND (text = '${searchQuery}')`
+      if(valueFilter.length > 0) return `(text = '${searchQuery}')`
       else return ''
     default:
       return ''
@@ -210,6 +173,24 @@ const checkExitsLastComment = (lastComment, searchQuery) => {
   } else return false
 }
 
+const getRevemoveDuplicate = (comments, offset, limit) => {
+  const checkDuplicateSet = new Set();
+  const result = [];
+  let index = 0
+  for (const comment of comments) {
+    const key = comment.text + comment.author_id;
+    if (!checkDuplicateSet.has(key)) {
+      checkDuplicateSet.add(key);
+      if(index >= offset && index < offset + limit) {
+        result.push(comment);
+      }
+      index ++
+    }
+  }
+  return { result, index }
+}
+
+
 const getCaseSensitive = (comments, searchQuery) => {
   return comments.map(comment => {
     if(comment.text.includes(searchQuery)) return comment
@@ -234,8 +215,15 @@ app.post('/createIndexesMeiliSearch/:idChannel', async (req, res) => {
       return Promise.all([
         processUpdateFilterAble,
         processUpdateSearchAble,
-        client.index('comments_' + req.params.idChannel).updateSettings({ pagination: { maxTotalHits: 1000000 }}),
-        client.index('reaction_' + req.params.idChannel).updateSettings({ pagination: { maxTotalHits: 50000 }})
+        client.index('comments_' + req.params.idChannel)
+        .updateSettings(
+          { 
+            pagination: { maxTotalHits: maxCommnetIndexHits },
+            faceting: { maxValuesPerFacet: maxCommnetIndexHits}
+          }),
+        client.index('reaction_' + req.params.idChannel).updateSettings({ pagination: { maxTotalHits: maxReactionIndexHits }}),
+        client.index('share_' + req.params.idChannel).updateSettings({ pagination: { maxTotalHits: maxShareIndexHits }})
+       
       ])
     })
     .then(() => {
@@ -269,7 +257,13 @@ app.post('/meiliSearchFilter/:idChannel', async (req, res) => {
     let limit = req.body.rowsPaging ? parseInt(req.body.rowsPaging) : 20
     let offset = req.body.pagePaging > 1 ? (req.body.pagePaging - 1) * limit : 0
     let filterByCaseSensitive = req.body.caseSensitive
+    let filterByRemoveDuplicate = req.body.removeDuplicateComment
+    let filterByLastComment = req.body.filterLatestComment?.length > 0 
     let lastComment = req.body.filterLatestComment
+    if(filterByLastComment || filterByRemoveDuplicate) {
+      limit = maxCommnetIndexHits
+      offset = 0
+    } 
     if(checkInvalidQuery(req.body, searchStr)) {
       res.json({success: false, message: 'Invalid filter'})
     } else {
@@ -284,6 +278,13 @@ app.post('/meiliSearchFilter/:idChannel', async (req, res) => {
         })
         .then(comments => {
           if(filterByCaseSensitive) comments.hits = getCaseSensitive(comments.hits, searchStr)
+          if(filterByRemoveDuplicate || filterByLastComment) {
+            let limit = req.body.rowsPaging ? parseInt(req.body.rowsPaging) : 20
+            let offset = req.body.pagePaging > 1 ? (req.body.pagePaging - 1) * limit : 0
+            const { result, index } = getRevemoveDuplicate(comments.hits, offset, limit)
+            comments.hits = result
+            comments.estimatedTotalHits = index
+          } 
           res.status(200).json({comments})
         })
       } else {
@@ -293,7 +294,6 @@ app.post('/meiliSearchFilter/:idChannel', async (req, res) => {
   } catch(e) {
     res.status(500).json({success: false, message: 'invali server when search'})
   }
-  
 })
 
 app.listen(3000, () => {
